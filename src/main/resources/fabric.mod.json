@@ -1,0 +1,24 @@
+{
+    "schemaVersion": 1,
+    "id": "caine",
+    "version": "${version}",
+    "name": "CAINE",
+    "description": "CAINE from The Amazing Digital Circus - AI-powered player controller using Gemini CLI",
+    "authors": ["dashie"],
+    "contact": {},
+    "license": "MIT",
+    "environment": "client",
+    "entrypoints": {
+        "client": ["com.dashie.caine.CaineModClient"]
+    },
+    "mixins": [],
+    "depends": {
+        "fabricloader": ">=0.16.0",
+        "fabric-api": "*",
+        "minecraft": "~1.21.1",
+        "java": ">=21"
+    },
+    "suggests": {
+        "baritone": "*"
+    }
+}
