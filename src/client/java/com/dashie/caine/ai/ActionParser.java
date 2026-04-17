@@ -213,6 +213,61 @@ public class ActionParser {
                                 Math.max(1, Math.min(num(obj, "repeat", 1), 1000)),
                                 str(obj, "stop_condition", ""));
                     }
+                    case "learn_skill" -> {
+                        List<String> cmds = new ArrayList<>();
+                        if (obj.has("commands") && obj.get("commands").isJsonArray()) {
+                            for (JsonElement cmd : obj.getAsJsonArray("commands")) {
+                                if (!cmd.isJsonNull()) cmds.add(cmd.getAsString());
+                            }
+                        }
+                        List<String> triggers = new ArrayList<>();
+                        if (obj.has("trigger_phrases") && obj.get("trigger_phrases").isJsonArray()) {
+                            for (JsonElement t : obj.getAsJsonArray("trigger_phrases")) {
+                                if (!t.isJsonNull()) triggers.add(t.getAsString());
+                            }
+                        }
+                        yield new Action.LearnSkill(
+                                str(obj, "name", ""),
+                                str(obj, "description", ""),
+                                cmds, triggers);
+                    }
+                    case "use_skill" -> new Action.UseSkill(
+                            str(obj, "name", ""),
+                            str(obj, "context", ""));
+                    case "improve_skill" -> {
+                        List<String> cmds = new ArrayList<>();
+                        if (obj.has("commands") && obj.get("commands").isJsonArray()) {
+                            for (JsonElement cmd : obj.getAsJsonArray("commands")) {
+                                if (!cmd.isJsonNull()) cmds.add(cmd.getAsString());
+                            }
+                        }
+                        yield new Action.ImproveSkill(
+                                str(obj, "name", ""),
+                                str(obj, "description", ""),
+                                cmds);
+                    }
+                    case "forget_skill" -> new Action.ForgetSkill(str(obj, "name", ""));
+                    case "list_skills" -> new Action.ListSkills();
+                    case "build_structure" -> new Action.BuildStructure(
+                            str(obj, "description", ""),
+                            Math.max(0, Math.min(num(obj, "width", 0), 100)),
+                            Math.max(0, Math.min(num(obj, "height", 0), 100)),
+                            Math.max(0, Math.min(num(obj, "depth", 0), 100)),
+                            str(obj, "style", ""),
+                            str(obj, "player", ""));
+                    case "download_schematic" -> new Action.DownloadSchematic(
+                            str(obj, "url", ""),
+                            str(obj, "name", ""));
+                    case "place_schematic" -> new Action.PlaceSchematic(
+                            str(obj, "name", ""),
+                            num(obj, "x", 0),
+                            num(obj, "y", 64),
+                            num(obj, "z", 0),
+                            str(obj, "player", ""));
+                    case "list_schematics" -> new Action.ListSchematics();
+                    case "undo_build" -> new Action.UndoBuild();
+                    case "scan_terrain" -> new Action.ScanTerrain(
+                            Math.max(4, Math.min(num(obj, "radius", 8), 16)));
                     default -> {
                         CaineModClient.LOGGER.warn("Unknown action type: {}", type);
                         yield null;

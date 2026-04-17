@@ -1,5 +1,8 @@
 package com.dashie.caine.ai;
 
+import com.dashie.caine.build.BuildHistory;
+import com.dashie.caine.build.LitematicaWrapper;
+import com.dashie.caine.build.SchematicManager;
 import com.dashie.caine.chat.ChatManager;
 import com.dashie.caine.game.GameStateProvider;
 import com.dashie.caine.memory.MemoryManager;
@@ -10,12 +13,62 @@ public class PromptBuilder {
 
     public static String build(ChatManager chatManager, GameStateProvider gameState,
                                MemoryManager memoryManager, String triggerType, String triggerSender,
-                               boolean hasAdminPass) {
+                               boolean hasAdminPass, BuildHistory buildHistory, SchematicManager schematicManager,
+                               LitematicaWrapper litematica) {
         StringBuilder sb = new StringBuilder();
 
         // Game state context (now includes surroundings/vision)
         sb.append(gameState.getGameStateString());
         sb.append("\n");
+
+        // Terrain awareness — compact scan
+        String terrain = gameState.getTerrainScan(8);
+        if (!terrain.isEmpty()) {
+            sb.append(terrain);
+            sb.append("\n");
+        }
+
+        // Build history — so CAINE knows what it has built
+        if (buildHistory != null && buildHistory.size() > 0) {
+            sb.append("=== BUILD HISTORY (can undo) ===\n");
+            for (String summary : buildHistory.getHistorySummaries()) {
+                sb.append("  - ").append(summary).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        // Stored schematics
+        if (schematicManager != null) {
+            List<String> schematics = schematicManager.listSchematics();
+            if (!schematics.isEmpty()) {
+                sb.append("=== STORED SCHEMATICS ===\n");
+                sb.append("Use 'place_schematic' to place these in the world");
+                if (litematica != null && litematica.isAvailable()) {
+                    if (litematica.isPrinterAvailable()) {
+                        sb.append(" (Litematica + Printer installed — hologram will be auto-built!)");
+                    } else {
+                        sb.append(" (Litematica is installed — full schematic support!)");
+                    }
+                } else {
+                    sb.append(" (Litematica not installed — limited placement support)");
+                }
+                sb.append("\n");
+                for (String s : schematics) {
+                    sb.append("  - ").append(s).append("\n");
+                }
+                sb.append("\n");
+            }
+        }
+
+        // Litematica status and active placements
+        if (litematica != null && litematica.isAvailable()) {
+            String placementInfo = litematica.getPlacementInfo();
+            if (!placementInfo.isEmpty()) {
+                sb.append("=== LITEMATICA ===\n");
+                sb.append(placementInfo);
+                sb.append("\n");
+            }
+        }
 
         // Memories — relevant context from CAINE's long-term memory
         String memories = buildMemorySection(memoryManager, chatManager, triggerSender);
@@ -23,6 +76,15 @@ public class PromptBuilder {
             sb.append("=== YOUR MEMORIES ===\n");
             sb.append("These are things you previously remembered. Use them for context.\n");
             sb.append(memories);
+            sb.append("\n");
+        }
+
+        // Skills — learned reusable procedures
+        String skills = memoryManager.getSkillsForPrompt();
+        if (!skills.isEmpty()) {
+            sb.append("=== YOUR LEARNED SKILLS ===\n");
+            sb.append("These are skills you've learned. Use 'use_skill' to execute them, or reference them when relevant.\n");
+            sb.append(skills);
             sb.append("\n");
         }
 
@@ -97,7 +159,7 @@ public class PromptBuilder {
         sb.append("The chat above shows what happened since then (command output, player responses, etc).\n");
         sb.append("Now decide your next actions based on what you observed.\n");
         sb.append("You can use 'observe' again if you need to wait for more output (max 5 rounds total).\n");
-        sb.append("You can also save_memory to remember important findings.\n");
+        sb.append("You can also save_memory to remember important findings, or learn_skill to save a reusable procedure.\n");
         sb.append("\nRespond with ONLY a JSON object: {\"thought\": \"...\", \"actions\": [...]}");
         sb.append("\nNo markdown. No code blocks. No explanation. Just the raw JSON.");
 

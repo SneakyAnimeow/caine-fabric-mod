@@ -2,6 +2,10 @@ package com.dashie.caine;
 
 import com.dashie.caine.action.ActionExecutor;
 import com.dashie.caine.ai.GeminiRunner;
+import com.dashie.caine.ai.StructureGenerator;
+import com.dashie.caine.build.BuildHistory;
+import com.dashie.caine.build.LitematicaWrapper;
+import com.dashie.caine.build.SchematicManager;
 import com.dashie.caine.chat.ChatManager;
 import com.dashie.caine.game.BaritoneWrapper;
 import com.dashie.caine.game.GameStateProvider;
@@ -61,8 +65,16 @@ public class CaineModClient implements ClientModInitializer {
         GameStateProvider gameState = new GameStateProvider();
         BaritoneWrapper baritone = new BaritoneWrapper();
         GeminiRunner gemini = new GeminiRunner(systemPromptPath);
+        StructureGenerator structureGenerator = new StructureGenerator(gemini);
+        BuildHistory buildHistory = new BuildHistory();
+        SchematicManager schematicManager = new SchematicManager(configDir);
+        LitematicaWrapper litematica = new LitematicaWrapper();
         ActionExecutor executor = new ActionExecutor(gameState, baritone, memoryManager, chatManager);
-        CaineScheduler scheduler = new CaineScheduler(chatManager, gameState, gemini, executor, memoryManager);
+        executor.setStructureGenerator(structureGenerator);
+        executor.setBuildHistory(buildHistory);
+        executor.setSchematicManager(schematicManager);
+        executor.setLitematicaWrapper(litematica);
+        CaineScheduler scheduler = new CaineScheduler(chatManager, gameState, gemini, executor, memoryManager, buildHistory, schematicManager, litematica);
 
         // Register chat receive events
         ClientReceiveMessageEvents.CHAT.register(chatManager::onChatMessage);

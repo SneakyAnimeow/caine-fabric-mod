@@ -1,6 +1,8 @@
 package com.dashie.caine.memory;
 
 import com.dashie.caine.CaineModClient;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonParser;
 
 import java.nio.file.Path;
 import java.sql.*;
@@ -38,6 +40,28 @@ public class MemoryManager {
             long days = TimeUnit.MILLISECONDS.toDays(diffMs);
             if (days < 30) return days + "d ago";
             return (days / 30) + "mo ago";
+        }
+    }
+
+    public record Skill(long id, String name, String description, List<String> commands,
+                        List<String> triggerPhrases, String learnedFrom, int timesUsed,
+                        long createdAt, long updatedAt) {
+        public String formatted() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("**").append(name).append("**");
+            if (description != null && !description.isEmpty()) {
+                sb.append(" — ").append(description);
+            }
+            if (commands != null && !commands.isEmpty()) {
+                sb.append(" [").append(commands.size()).append(" commands]");
+            }
+            if (timesUsed > 0) {
+                sb.append(" (used ").append(timesUsed).append("x)");
+            }
+            if (triggerPhrases != null && !triggerPhrases.isEmpty()) {
+                sb.append(" triggers: ").append(String.join(", ", triggerPhrases));
+            }
+            return sb.toString();
         }
     }
 
@@ -83,6 +107,24 @@ public class MemoryManager {
             }
             // Backfill updated_at for old rows
             stmt.execute("UPDATE memories SET updated_at = created_at WHERE updated_at = 0");
+
+            // Skills table — learned, reusable procedures
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    description TEXT NOT NULL,
+                    commands TEXT,
+                    trigger_phrases TEXT,
+                    learned_from TEXT,
+                    times_used INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            """);
+            stmt.execute("""
+                CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name COLLATE NOCASE)
+            """);
         }
     }
 
@@ -373,6 +415,202 @@ public class MemoryManager {
                 rs.getInt("importance"),
                 rs.getLong("created_at")
         );
+    }
+
+    // ======================== SKILL SYSTEM ========================
+
+    /**
+     * Saves or updates a skill (upsert by name).
+     * If a skill with the same name exists, updates its description, commands, and trigger phrases.
+     */
+    public void saveSkill(String name, String description, List<String> commands,
+                          List<String> triggerPhrases, String learnedFrom) {
+        if (name == null || name.isBlank()) return;
+
+        Skill existing = getSkill(name);
+        long now = System.currentTimeMillis();
+
+        if (existing != null) {
+            // Update existing skill
+            String sql = "UPDATE skills SET description = ?, commands = ?, trigger_phrases = ?, updated_at = ? WHERE id = ?";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setString(1, description);
+                ps.setString(2, toJsonArray(commands));
+                ps.setString(3, toJsonArray(triggerPhrases));
+                ps.setLong(4, now);
+                ps.setLong(5, existing.id());
+                ps.executeUpdate();
+                CaineModClient.LOGGER.info("Skill updated: {} — {}", name, description);
+            } catch (SQLException e) {
+                CaineModClient.LOGGER.error("Failed to update skill: {}", name, e);
+            }
+        } else {
+            // Insert new skill
+            String sql = "INSERT INTO skills (name, description, commands, trigger_phrases, learned_from, times_used, created_at, updated_at) " +
+                    "VALUES (?, ?, ?, ?, ?, 0, ?, ?)";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setString(1, name.toLowerCase().replace(' ', '_'));
+                ps.setString(2, description);
+                ps.setString(3, toJsonArray(commands));
+                ps.setString(4, toJsonArray(triggerPhrases));
+                ps.setString(5, learnedFrom);
+                ps.setLong(6, now);
+                ps.setLong(7, now);
+                ps.executeUpdate();
+                CaineModClient.LOGGER.info("Skill learned: {} — {} (from: {})", name, description, learnedFrom);
+            } catch (SQLException e) {
+                CaineModClient.LOGGER.error("Failed to save skill: {}", name, e);
+            }
+        }
+    }
+
+    /**
+     * Retrieves a skill by name (case-insensitive).
+     */
+    public Skill getSkill(String name) {
+        String sql = "SELECT * FROM skills WHERE name = ? COLLATE NOCASE LIMIT 1";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, name);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return readSkill(rs);
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to get skill: {}", name, e);
+        }
+        return null;
+    }
+
+    /**
+     * Returns all learned skills, ordered by usage count (most used first).
+     */
+    public List<Skill> getAllSkills() {
+        List<Skill> skills = new ArrayList<>();
+        String sql = "SELECT * FROM skills ORDER BY times_used DESC, updated_at DESC";
+        try (Statement stmt = connection.createStatement()) {
+            ResultSet rs = stmt.executeQuery(sql);
+            while (rs.next()) {
+                skills.add(readSkill(rs));
+            }
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to list skills", e);
+        }
+        return skills;
+    }
+
+    /**
+     * Searches skills by name, description, or trigger phrase keyword.
+     */
+    public List<Skill> searchSkills(String keyword) {
+        List<Skill> skills = new ArrayList<>();
+        String sql = "SELECT * FROM skills WHERE name LIKE ? COLLATE NOCASE " +
+                "OR description LIKE ? COLLATE NOCASE " +
+                "OR trigger_phrases LIKE ? COLLATE NOCASE " +
+                "ORDER BY times_used DESC LIMIT 10";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            String pattern = "%" + keyword + "%";
+            ps.setString(1, pattern);
+            ps.setString(2, pattern);
+            ps.setString(3, pattern);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                skills.add(readSkill(rs));
+            }
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to search skills for: {}", keyword, e);
+        }
+        return skills;
+    }
+
+    /**
+     * Builds the skills section for the AI prompt context.
+     */
+    public String getSkillsForPrompt() {
+        List<Skill> skills = getAllSkills();
+        if (skills.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder();
+        for (Skill s : skills) {
+            sb.append("  - ").append(s.formatted()).append("\n");
+        }
+        sb.append("  Total skills learned: ").append(skills.size()).append("\n");
+        return sb.toString();
+    }
+
+    /**
+     * Increments the usage counter for a skill.
+     */
+    public void incrementSkillUsage(String name) {
+        String sql = "UPDATE skills SET times_used = times_used + 1, updated_at = ? WHERE name = ? COLLATE NOCASE";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, System.currentTimeMillis());
+            ps.setString(2, name);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to increment skill usage: {}", name, e);
+        }
+    }
+
+    /**
+     * Deletes a skill by name. Returns true if deleted.
+     */
+    public boolean deleteSkill(String name) {
+        String sql = "DELETE FROM skills WHERE name = ? COLLATE NOCASE";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, name);
+            int rows = ps.executeUpdate();
+            if (rows > 0) {
+                CaineModClient.LOGGER.info("Skill forgotten: {}", name);
+                return true;
+            }
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to delete skill: {}", name, e);
+        }
+        return false;
+    }
+
+    /**
+     * Returns total number of skills.
+     */
+    public int getSkillCount() {
+        try (Statement stmt = connection.createStatement()) {
+            ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM skills");
+            if (rs.next()) return rs.getInt(1);
+        } catch (SQLException e) {
+            CaineModClient.LOGGER.error("Failed to count skills", e);
+        }
+        return 0;
+    }
+
+    private Skill readSkill(ResultSet rs) throws SQLException {
+        return new Skill(
+                rs.getLong("id"),
+                rs.getString("name"),
+                rs.getString("description"),
+                fromJsonArray(rs.getString("commands")),
+                fromJsonArray(rs.getString("trigger_phrases")),
+                rs.getString("learned_from"),
+                rs.getInt("times_used"),
+                rs.getLong("created_at"),
+                rs.getLong("updated_at")
+        );
+    }
+
+    private static String toJsonArray(List<String> list) {
+        if (list == null || list.isEmpty()) return null;
+        JsonArray arr = new JsonArray();
+        for (String s : list) arr.add(s);
+        return arr.toString();
+    }
+
+    private static List<String> fromJsonArray(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try {
+            JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
+            List<String> result = new ArrayList<>();
+            for (var el : arr) result.add(el.getAsString());
+            return result;
+        } catch (Exception e) {
+            return List.of();
+        }
     }
 
     public void close() {

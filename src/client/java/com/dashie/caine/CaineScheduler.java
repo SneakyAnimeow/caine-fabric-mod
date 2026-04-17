@@ -5,6 +5,9 @@ import com.dashie.caine.action.ActionExecutor;
 import com.dashie.caine.ai.ActionParser;
 import com.dashie.caine.ai.GeminiRunner;
 import com.dashie.caine.ai.PromptBuilder;
+import com.dashie.caine.build.BuildHistory;
+import com.dashie.caine.build.LitematicaWrapper;
+import com.dashie.caine.build.SchematicManager;
 import com.dashie.caine.chat.ChatManager;
 import com.dashie.caine.game.GameStateProvider;
 import com.dashie.caine.memory.MemoryManager;
@@ -29,6 +32,9 @@ public class CaineScheduler {
     private final GeminiRunner gemini;
     private final ActionExecutor executor;
     private final MemoryManager memoryManager;
+    private final BuildHistory buildHistory;
+    private final SchematicManager schematicManager;
+    private final LitematicaWrapper litematica;
     private final Random random = new Random();
 
     private int debounceTicks = 0;
@@ -42,12 +48,17 @@ public class CaineScheduler {
     private boolean debounceIsPro = false;
 
     public CaineScheduler(ChatManager chatManager, GameStateProvider gameState,
-                          GeminiRunner gemini, ActionExecutor executor, MemoryManager memoryManager) {
+                          GeminiRunner gemini, ActionExecutor executor, MemoryManager memoryManager,
+                          BuildHistory buildHistory, SchematicManager schematicManager,
+                          LitematicaWrapper litematica) {
         this.chatManager = chatManager;
         this.gameState = gameState;
         this.gemini = gemini;
         this.executor = executor;
         this.memoryManager = memoryManager;
+        this.buildHistory = buildHistory;
+        this.schematicManager = schematicManager;
+        this.litematica = litematica;
         this.nextPeriodicTrigger = randomInterval();
 
         // Wire the observe-think-act followup handler (pro model persists through followups)
@@ -139,7 +150,7 @@ public class CaineScheduler {
             CaineModClient.LOGGER.info("Admin pass detected for player: {}", sender);
         }
 
-        String prompt = PromptBuilder.build(chatManager, gameState, memoryManager, reason, sender, hasAdminPass);
+        String prompt = PromptBuilder.build(chatManager, gameState, memoryManager, reason, sender, hasAdminPass, buildHistory, schematicManager, litematica);
 
         gemini.sendPrompt(prompt, usePro,
                 response -> {

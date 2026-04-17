@@ -1,6 +1,10 @@
 package com.dashie.caine.action;
 
 import com.dashie.caine.CaineModClient;
+import com.dashie.caine.ai.StructureGenerator;
+import com.dashie.caine.build.BuildHistory;
+import com.dashie.caine.build.LitematicaWrapper;
+import com.dashie.caine.build.SchematicManager;
 import com.dashie.caine.chat.ChatManager;
 import com.dashie.caine.game.BaritoneWrapper;
 import com.dashie.caine.game.GameStateProvider;
@@ -52,6 +56,10 @@ public class ActionExecutor {
     }
 
     private FollowupHandler followupHandler;
+    private StructureGenerator structureGenerator;
+    private BuildHistory buildHistory;
+    private SchematicManager schematicManager;
+    private LitematicaWrapper litematica;
 
     public ActionExecutor(GameStateProvider gameState, BaritoneWrapper baritone, MemoryManager memoryManager, ChatManager chatManager) {
         this.gameState = gameState;
@@ -62,6 +70,22 @@ public class ActionExecutor {
 
     public void setFollowupHandler(FollowupHandler handler) {
         this.followupHandler = handler;
+    }
+
+    public void setStructureGenerator(StructureGenerator generator) {
+        this.structureGenerator = generator;
+    }
+
+    public void setBuildHistory(BuildHistory history) {
+        this.buildHistory = history;
+    }
+
+    public void setSchematicManager(SchematicManager manager) {
+        this.schematicManager = manager;
+    }
+
+    public void setLitematicaWrapper(LitematicaWrapper wrapper) {
+        this.litematica = wrapper;
     }
 
     /**
@@ -158,6 +182,18 @@ public class ActionExecutor {
             case Action.BackupInventory bi -> executeBackupInventory(bi.player());
             case Action.RestoreInventory ri -> executeRestoreInventory(ri.player());
             case Action.RunScript rs -> executeRunScript(rs.commands(), rs.delayTicks(), rs.repeat(), rs.stopCondition());
+            case Action.LearnSkill ls -> executeLearnSkill(ls.name(), ls.description(), ls.commands(), ls.triggerPhrases());
+            case Action.UseSkill us -> executeUseSkill(us.name(), us.context());
+            case Action.ImproveSkill is -> executeImproveSkill(is.name(), is.description(), is.commands());
+            case Action.ForgetSkill fs -> executeForgetSkill(fs.name());
+            case Action.ListSkills ignored -> executeListSkills();
+            case Action.BuildStructure bs -> executeBuildStructure(bs.description(), bs.width(), bs.height(),
+                    bs.depth(), bs.style(), bs.player());
+            case Action.DownloadSchematic ds -> executeDownloadSchematic(ds.url(), ds.name());
+            case Action.PlaceSchematic ps -> executePlaceSchematic(ps.name(), ps.x(), ps.y(), ps.z(), ps.player());
+            case Action.ListSchematics ignored -> executeListSchematics();
+            case Action.UndoBuild ignored -> executeUndoBuild();
+            case Action.ScanTerrain st -> executeScanTerrain(st.radius());
         }
     }
 
@@ -495,6 +531,270 @@ public class ActionExecutor {
             }
         }
         return closest;
+    }
+
+    // ======================== SKILL SYSTEM ========================
+
+    private void executeLearnSkill(String name, String description, List<String> commands, List<String> triggerPhrases) {
+        if (name.isEmpty() || description.isEmpty()) {
+            CaineModClient.LOGGER.warn("Cannot learn skill with empty name or description");
+            return;
+        }
+        // The last targeted player is the one teaching (or null if self-learned)
+        String learnedFrom = lastTargetPlayer;
+        memoryManager.saveSkill(name, description, commands, triggerPhrases, learnedFrom);
+    }
+
+    private void executeUseSkill(String name, String context) throws InterruptedException {
+        if (name.isEmpty()) return;
+        var skill = memoryManager.getSkill(name);
+        if (skill == null) {
+            CaineModClient.LOGGER.warn("Skill not found: {}", name);
+            return;
+        }
+
+        memoryManager.incrementSkillUsage(name);
+        CaineModClient.LOGGER.info("Using skill: {} (used {}x) — {}", name, skill.timesUsed() + 1, skill.description());
+
+        // If the skill has concrete commands, execute them like a run_script
+        if (skill.commands() != null && !skill.commands().isEmpty()) {
+            executeRunScript(skill.commands(), 1, 1, "");
+        } else {
+            // AI-interpreted skill — the context + description will be used by the LLM
+            // on the next observe round. Log it for the prompt to pick up.
+            CaineModClient.LOGGER.info("Skill '{}' has no commands — AI will interpret: {}", name, skill.description());
+        }
+    }
+
+    private void executeImproveSkill(String name, String description, List<String> commands) {
+        if (name.isEmpty()) return;
+        var existing = memoryManager.getSkill(name);
+        if (existing == null) {
+            CaineModClient.LOGGER.warn("Cannot improve non-existent skill: {}", name);
+            return;
+        }
+        String newDesc = description.isEmpty() ? existing.description() : description;
+        List<String> newCmds = commands.isEmpty() ? existing.commands() : commands;
+        memoryManager.saveSkill(name, newDesc, newCmds, existing.triggerPhrases(), existing.learnedFrom());
+    }
+
+    private void executeForgetSkill(String name) {
+        if (name.isEmpty()) return;
+        boolean deleted = memoryManager.deleteSkill(name);
+        if (!deleted) {
+            CaineModClient.LOGGER.warn("Skill not found to forget: {}", name);
+        }
+    }
+
+    private void executeListSkills() {
+        var skills = memoryManager.getAllSkills();
+        if (skills.isEmpty()) {
+            CaineModClient.LOGGER.info("No skills learned yet");
+        } else {
+            CaineModClient.LOGGER.info("Learned skills ({}):", skills.size());
+            for (var s : skills) {
+                CaineModClient.LOGGER.info("  Skill: {} — {} [{}cmds, used {}x, from: {}]",
+                        s.name(), s.description(),
+                        s.commands() != null ? s.commands().size() : 0,
+                        s.timesUsed(), s.learnedFrom());
+            }
+        }
+    }
+
+    // ======================== STRUCTURE GENERATION ========================
+
+    private void executeBuildStructure(String description, int width, int height, int depth,
+                                       String style, String player) throws InterruptedException {
+        if (description.isEmpty()) {
+            CaineModClient.LOGGER.warn("Cannot build structure with empty description");
+            return;
+        }
+        if (structureGenerator == null) {
+            CaineModClient.LOGGER.error("Structure generator not initialized");
+            return;
+        }
+
+        // Get current position for relative coordinate generation
+        MinecraftClient client = MinecraftClient.getInstance();
+        double posX = 0, posY = 64, posZ = 0;
+        if (client.player != null) {
+            posX = client.player.getX();
+            posY = client.player.getY();
+            posZ = client.player.getZ();
+        }
+
+        // If a player target was specified and we should TP there first
+        if (!player.isEmpty()) {
+            executeTpToPlayer(player);
+            Thread.sleep(1000); // Wait for TP to settle
+            // Update position after TP
+            if (client.player != null) {
+                posX = client.player.getX();
+                posY = client.player.getY();
+                posZ = client.player.getZ();
+            }
+        }
+
+        // Capture area before building (for undo)
+        if (buildHistory != null) {
+            int effectiveWidth = Math.max(width, 5);
+            int effectiveHeight = Math.max(height, 5);
+            int effectiveDepth = Math.max(depth, 5);
+            buildHistory.captureArea(description,
+                    (int) posX + 1, (int) posY, (int) posZ + 1,
+                    (int) posX + effectiveWidth, (int) posY + effectiveHeight, (int) posZ + effectiveDepth);
+        }
+
+        CaineModClient.LOGGER.info("Generating structure '{}' at ({}, {}, {})", description,
+                (int) posX, (int) posY, (int) posZ);
+
+        // Use pro model = false by default; the caller context determines this
+        List<String> commands = structureGenerator.generate(
+                description, width, height, depth, style, posX, posY, posZ, false);
+
+        if (commands.isEmpty()) {
+            CaineModClient.LOGGER.warn("Structure generation produced no commands for: {}", description);
+            return;
+        }
+
+        CaineModClient.LOGGER.info("Executing {} structure commands for '{}'", commands.size(), description);
+        // Execute with 1-tick delay between commands for server processing
+        executeRunScript(commands, 1, 1, "");
+    }
+
+    // ======================== SCHEMATIC MANAGEMENT ========================
+
+    private void executeDownloadSchematic(String url, String name) {
+        if (schematicManager == null) {
+            CaineModClient.LOGGER.error("Schematic manager not initialized");
+            chatManager.addInternalFeedback("Schematic download FAILED: schematic manager not initialized");
+            return;
+        }
+        if (url.isEmpty()) {
+            CaineModClient.LOGGER.warn("Cannot download schematic with empty URL");
+            chatManager.addInternalFeedback("Schematic download FAILED: empty URL");
+            return;
+        }
+        java.nio.file.Path result = schematicManager.downloadSchematic(url, name.isEmpty() ? null : name);
+        if (result != null) {
+            CaineModClient.LOGGER.info("Schematic downloaded successfully: {}", result.getFileName());
+            chatManager.addInternalFeedback("Schematic downloaded OK: " + result.getFileName() + ". Use place_schematic to place it.");
+        } else {
+            CaineModClient.LOGGER.warn("Schematic download failed for URL: {}", url);
+            chatManager.addInternalFeedback("Schematic download FAILED for URL: " + url + ". Check if the link is a direct download link.");
+        }
+    }
+
+    private void executeListSchematics() {
+        if (schematicManager == null) {
+            CaineModClient.LOGGER.info("No schematic manager available");
+            chatManager.addInternalFeedback("No schematic manager available");
+            return;
+        }
+        List<String> schematics = schematicManager.listSchematics();
+        if (schematics.isEmpty()) {
+            CaineModClient.LOGGER.info("No schematics stored");
+            chatManager.addInternalFeedback("No schematics stored yet.");
+        } else {
+            String list = String.join(", ", schematics);
+            CaineModClient.LOGGER.info("Stored schematics: {}", list);
+            chatManager.addInternalFeedback("Stored schematics: " + list);
+        }
+    }
+
+    private void executePlaceSchematic(String name, int x, int y, int z, String player) throws InterruptedException {
+        if (schematicManager == null) {
+            CaineModClient.LOGGER.error("Schematic manager not initialized");
+            chatManager.addInternalFeedback("Cannot place schematic: schematic manager not initialized");
+            return;
+        }
+        if (name.isEmpty()) {
+            CaineModClient.LOGGER.warn("Cannot place schematic with empty name");
+            chatManager.addInternalFeedback("Cannot place schematic: empty name");
+            return;
+        }
+
+        // If a player target was specified, TP there first
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (!player.isEmpty()) {
+            executeTpToPlayer(player);
+            Thread.sleep(1000);
+        }
+
+        // Resolve position: if 0,64,0 (defaults), use player position
+        int placeX = x, placeY = y, placeZ = z;
+        if (x == 0 && y == 64 && z == 0 && client.player != null) {
+            placeX = (int) client.player.getX();
+            placeY = (int) client.player.getY();
+            placeZ = (int) client.player.getZ();
+        }
+
+        java.nio.file.Path schematicPath = schematicManager.getSchematicPath(name);
+        if (schematicPath == null) {
+            CaineModClient.LOGGER.warn("Schematic not found: {}", name);
+            chatManager.addInternalFeedback("Schematic not found: " + name);
+            return;
+        }
+
+        // Optionally load Litematica hologram for visual reference
+        if (litematica != null && litematica.isAvailable()) {
+            CaineModClient.LOGGER.info("Loading Litematica hologram for '{}'", name);
+            Object schematic = litematica.loadSchematic(schematicPath.toFile());
+            if (schematic != null) {
+                litematica.createPlacement(schematic, placeX, placeY, placeZ, name);
+                CaineModClient.LOGGER.info("Litematica hologram loaded for visual reference");
+            }
+        }
+
+        // Parse schematic file and generate /setblock commands (reliable — uses OP commands)
+        CaineModClient.LOGGER.info("Parsing schematic '{}' for command-based building at ({}, {}, {})",
+                name, placeX, placeY, placeZ);
+        List<String> commands = schematicManager.schematicToCommands(schematicPath, placeX, placeY, placeZ);
+
+        if (commands.isEmpty()) {
+            CaineModClient.LOGGER.warn("No build commands generated from schematic '{}'", name);
+            chatManager.addInternalFeedback("Could not parse schematic '" + name + "' for building. Only .litematic format is supported for direct building.");
+            return;
+        }
+
+        // Capture area for undo before building
+        if (buildHistory != null) {
+            var schematicSize = schematicManager.getSchematicSize(schematicPath);
+            if (schematicSize != null) {
+                buildHistory.captureArea("Schematic: " + name,
+                        placeX, placeY, placeZ,
+                        placeX + schematicSize.sizeX(),
+                        placeY + schematicSize.sizeY(),
+                        placeZ + schematicSize.sizeZ());
+            }
+        }
+
+        chatManager.addInternalFeedback("Building schematic '" + name + "' with " + commands.size()
+                + " blocks at (" + placeX + ", " + placeY + ", " + placeZ + ")... This may take a moment.");
+        CaineModClient.LOGGER.info("Executing {} setblock commands for schematic '{}'", commands.size(), name);
+        executeRunScript(commands, 1, 1, "");
+        chatManager.addInternalFeedback("Schematic '" + name + "' built! (" + commands.size() + " blocks placed)");
+    }
+
+    private void executeUndoBuild() throws InterruptedException {
+        if (buildHistory == null || buildHistory.size() == 0) {
+            CaineModClient.LOGGER.info("No builds to undo");
+            return;
+        }
+        var snapshot = buildHistory.peekLatest();
+        CaineModClient.LOGGER.info("Undoing build: {}", snapshot.summary());
+
+        List<String> undoCommands = buildHistory.generateUndoCommands();
+        if (!undoCommands.isEmpty()) {
+            executeRunScript(undoCommands, 1, 1, "");
+            buildHistory.popLatest();
+            CaineModClient.LOGGER.info("Build undone: {} commands executed", undoCommands.size());
+        }
+    }
+
+    private void executeScanTerrain(int radius) {
+        String scan = gameState.getTerrainScan(radius);
+        CaineModClient.LOGGER.info("Terrain scan result:\n{}", scan);
     }
 
     private void executeBackupInventory(String player) {

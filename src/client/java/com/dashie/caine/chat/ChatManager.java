@@ -264,6 +264,17 @@ public class ChatManager {
     }
 
     /**
+     * Injects an internal system message into the chat history.
+     * These are visible to CAINE in observe/followup rounds but NOT sent to the server.
+     * Use this for action result feedback (download status, build status, etc.).
+     */
+    public synchronized void addInternalFeedback(String message) {
+        addEntry(new ChatEntry(++messageIdCounter, System.currentTimeMillis(),
+                "SYSTEM", "[CAINE Internal] " + message, true, false));
+        CaineModClient.LOGGER.info("[Feedback] {}", message);
+    }
+
+    /**
      * Returns the names of the most recent distinct chat senders (excluding system and self).
      */
     public synchronized List<String> getRecentSenders(int maxCount) {

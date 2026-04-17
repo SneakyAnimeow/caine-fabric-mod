@@ -22,6 +22,7 @@ import net.minecraft.world.RaycastContext;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -422,5 +423,223 @@ public class GameStateProvider {
         if (client.player == null || client.world == null) return "unknown";
         BlockPos below = client.player.getBlockPos().down();
         return client.world.getBlockState(below).getBlock().getName().getString();
+    }
+
+    // ======================== TERRAIN AWARENESS ========================
+
+    /**
+     * Generates a detailed terrain scan of the area around the player.
+     * This gives CAINE a "picture" of the landscape: height map, block composition,
+     * open spaces, and terrain features.
+     *
+     * @param radius Horizontal radius to scan (max 16)
+     * @return Human-readable terrain description
+     */
+    public String getTerrainScan(int radius) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null || client.world == null) return "Cannot scan — not in world";
+        radius = Math.min(radius, 16);
+
+        ClientWorld world = client.world;
+        BlockPos playerPos = client.player.getBlockPos();
+        int px = playerPos.getX(), py = playerPos.getY(), pz = playerPos.getZ();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== TERRAIN SCAN (").append(radius * 2 + 1).append("x").append(radius * 2 + 1).append(" area) ===\n");
+        sb.append("Center: (").append(px).append(", ").append(py).append(", ").append(pz).append(")\n");
+
+        // 1. Height map — surface elevation relative to player
+        int[][] heightMap = new int[radius * 2 + 1][radius * 2 + 1];
+        Map<String, Integer> surfaceBlocks = new LinkedHashMap<>();
+        int airCount = 0;
+        int solidCount = 0;
+        int waterCount = 0;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                // Find surface: scan down from player + 20 to player - 20
+                int surfaceY = py;
+                boolean found = false;
+                for (int dy = 20; dy >= -20; dy--) {
+                    BlockPos checkPos = new BlockPos(px + dx, py + dy, pz + dz);
+                    BlockState state = world.getBlockState(checkPos);
+                    if (!state.isAir()) {
+                        // Check if block above is air/fluid (this is the surface)
+                        BlockState above = world.getBlockState(checkPos.up());
+                        if (above.isAir() || !above.getFluidState().isEmpty()) {
+                            surfaceY = py + dy;
+                            found = true;
+                            String blockName = state.getBlock().getName().getString();
+                            surfaceBlocks.merge(blockName, 1, Integer::sum);
+                            if (!state.getFluidState().isEmpty()) waterCount++;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    surfaceY = py - 20;
+                    airCount++;
+                }
+
+                heightMap[dx + radius][dz + radius] = surfaceY - py;
+                minY = Math.min(minY, surfaceY);
+                maxY = Math.max(maxY, surfaceY);
+                solidCount++;
+            }
+        }
+
+        // 2. Terrain shape summary
+        int heightRange = maxY - minY;
+        if (heightRange <= 2) {
+            sb.append("Terrain: FLAT (").append(heightRange).append(" block variation)\n");
+        } else if (heightRange <= 6) {
+            sb.append("Terrain: GENTLE HILLS (").append(heightRange).append(" block variation)\n");
+        } else if (heightRange <= 15) {
+            sb.append("Terrain: HILLY (").append(heightRange).append(" block variation)\n");
+        } else {
+            sb.append("Terrain: MOUNTAINOUS/CLIFF (").append(heightRange).append(" block variation)\n");
+        }
+
+        // 3. Surface composition — top 5 blocks
+        sb.append("Surface composition:\n");
+        surfaceBlocks.entrySet().stream()
+                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                .limit(5)
+                .forEach(e -> sb.append("  ").append(e.getKey()).append(": ").append(e.getValue()).append(" blocks\n"));
+
+        if (waterCount > 0) {
+            sb.append("  Water: ").append(waterCount).append(" surface blocks\n");
+        }
+
+        // 4. Compact height map (North-South cross section and East-West)
+        sb.append("Height profile (N→S through center, relative to you):\n  ");
+        for (int dz = -radius; dz <= radius; dz += Math.max(1, radius / 4)) {
+            int h = heightMap[radius][dz + radius]; // center column, varying z
+            sb.append(formatHeight(h)).append(" ");
+        }
+        sb.append("\n");
+
+        sb.append("Height profile (W→E through center, relative to you):\n  ");
+        for (int dx = -radius; dx <= radius; dx += Math.max(1, radius / 4)) {
+            int h = heightMap[dx + radius][radius]; // varying x, center z
+            sb.append(formatHeight(h)).append(" ");
+        }
+        sb.append("\n");
+
+        // 5. Open space assessment — good for building?
+        int flatBlocks = 0;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (Math.abs(heightMap[dx + radius][dz + radius]) <= 1) {
+                    flatBlocks++;
+                }
+            }
+        }
+        int totalBlocks = (radius * 2 + 1) * (radius * 2 + 1);
+        int flatPercent = (flatBlocks * 100) / totalBlocks;
+        sb.append("Flat area (±1 block): ").append(flatPercent).append("% (").append(flatBlocks).append("/").append(totalBlocks).append(" blocks)\n");
+
+        // 6. Check for open air above player (vertical clearance)
+        int clearance = 0;
+        for (int dy = 1; dy <= 30; dy++) {
+            if (world.getBlockState(playerPos.up(dy)).isAir()) {
+                clearance++;
+            } else {
+                break;
+            }
+        }
+        sb.append("Vertical clearance above: ").append(clearance).append(" blocks\n");
+
+        // 7. Nearby structures / man-made blocks detection
+        int manMadeCount = 0;
+        List<String> structureBlocks = new ArrayList<>();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -5; dy <= 10; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = new BlockPos(px + dx, py + dy, pz + dz);
+                    BlockState state = world.getBlockState(pos);
+                    String id = state.getBlock().toString();
+                    if (isManMadeBlock(id)) {
+                        manMadeCount++;
+                        if (structureBlocks.size() < 5) {
+                            String name = state.getBlock().getName().getString();
+                            if (!structureBlocks.contains(name)) {
+                                structureBlocks.add(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (manMadeCount > 0) {
+            sb.append("Man-made blocks detected: ").append(manMadeCount)
+                    .append(" (types: ").append(String.join(", ", structureBlocks)).append(")\n");
+        }
+
+        return sb.toString();
+    }
+
+    /**
+     * Generates a focused scan of a specific area (for build site assessment).
+     */
+    public String scanBuildSite(int x1, int y1, int z1, int x2, int y2, int z2) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) return "Cannot scan — not in world";
+        ClientWorld world = client.world;
+
+        int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+        int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
+        int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
+
+        Map<String, Integer> blockCounts = new LinkedHashMap<>();
+        int total = 0, airCount = 0;
+
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    BlockState state = world.getBlockState(new BlockPos(x, y, z));
+                    total++;
+                    if (state.isAir()) {
+                        airCount++;
+                    } else {
+                        String name = state.getBlock().getName().getString();
+                        blockCounts.merge(name, 1, Integer::sum);
+                    }
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Build site scan (").append(minX).append(",").append(minY).append(",").append(minZ)
+                .append(" to ").append(maxX).append(",").append(maxY).append(",").append(maxZ).append("):\n");
+        sb.append("  Total blocks: ").append(total).append(", Air: ").append(airCount)
+                .append(" (").append(airCount * 100 / Math.max(total, 1)).append("%)\n");
+
+        if (!blockCounts.isEmpty()) {
+            sb.append("  Solid blocks:\n");
+            blockCounts.entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .limit(8)
+                    .forEach(e -> sb.append("    ").append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
+        }
+
+        return sb.toString();
+    }
+
+    private String formatHeight(int h) {
+        if (h > 0) return "+" + h;
+        if (h < 0) return String.valueOf(h);
+        return "=";
+    }
+
+    private boolean isManMadeBlock(String blockId) {
+        return blockId.contains("plank") || blockId.contains("brick") || blockId.contains("stairs")
+                || blockId.contains("slab") || blockId.contains("fence") || blockId.contains("wall")
+                || blockId.contains("glass") || blockId.contains("door") || blockId.contains("wool")
+                || blockId.contains("concrete") || blockId.contains("terracotta") || blockId.contains("quartz")
+                || blockId.contains("smooth_stone") || blockId.contains("polished") || blockId.contains("cut_")
+                || blockId.contains("chiseled") || blockId.contains("pillar") || blockId.contains("lantern")
+                || blockId.contains("torch") || blockId.contains("carpet") || blockId.contains("banner");
     }
 }

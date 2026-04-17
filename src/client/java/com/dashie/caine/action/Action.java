@@ -24,4 +24,17 @@ public sealed interface Action {
     record BackupInventory(String player) implements Action {}
     record RestoreInventory(String player) implements Action {}
     record RunScript(java.util.List<String> commands, int delayTicks, int repeat, String stopCondition) implements Action {}
+    record LearnSkill(String name, String description, java.util.List<String> commands,
+                      java.util.List<String> triggerPhrases) implements Action {}
+    record UseSkill(String name, String context) implements Action {}
+    record ImproveSkill(String name, String description, java.util.List<String> commands) implements Action {}
+    record ForgetSkill(String name) implements Action {}
+    record ListSkills() implements Action {}
+    record BuildStructure(String description, int width, int height, int depth,
+                          String style, String player) implements Action {}
+    record DownloadSchematic(String url, String name) implements Action {}
+    record PlaceSchematic(String name, int x, int y, int z, String player) implements Action {}
+    record ListSchematics() implements Action {}
+    record UndoBuild() implements Action {}
+    record ScanTerrain(int radius) implements Action {}
 }
