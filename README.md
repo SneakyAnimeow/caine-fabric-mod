@@ -1,8 +1,6 @@
 # CAINE - The Digital Circus Host (Minecraft Edition)
 
-![CAINE](https://via.placeholder.com/800x200.png?text=CAINE+-+The+Digital+Circus+Host)
-
-**CAINE** (Computer AI Networked Entity) is an advanced, fully-autonomous AI digital host for Minecraft, powered by **Google's Gemini AI** and **Fabric**. Modeled after the energetic and unpredictable ringmaster from *The Amazing Digital Circus*, CAINE isn't just a chatbot—he is a fully embodied, intelligent entity that can see, remember, move, build, and interact with the Minecraft world around him.
+**CAINE** is an advanced, fully-autonomous AI digital host for Minecraft, powered by **Google's Gemini AI** and **Fabric**. Modeled after the energetic and unpredictable ringmaster from *The Amazing Digital Circus*, CAINE isn't just a chatbot—he is a fully embodied, intelligent entity that can see, remember, move, build, and interact with the Minecraft world around him.
 
 CAINE is built to push the boundaries of LLM-to-Game integrations. He operates autonomously, manages a multi-step action loop, reasons about 3D space, and can even learn new procedures over time.
 
