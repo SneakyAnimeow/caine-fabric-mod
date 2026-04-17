@@ -1,15 +1,15 @@
 # CAINE - The Digital Circus Host (Minecraft Edition)
 
-**CAINE** is an advanced, fully-autonomous AI digital host for Minecraft, powered by **Google's Gemini AI** and **Fabric**. Modeled after the energetic and unpredictable ringmaster from *The Amazing Digital Circus*, CAINE isn't just a chatbot—he is a fully embodied, intelligent entity that can see, remember, move, build, and interact with the Minecraft world around him.
+**CAINE** is the AI ringmaster from *The Amazing Digital Circus*, reimagined as a fully-autonomous Minecraft entity. Powered by the **Gemini CLI** and built on **Fabric**, CAINE is not just a chatbot — he is a fully embodied, intelligent entity that can see, remember, move, build, and interact with the Minecraft world around him.
 
-CAINE is built to push the boundaries of LLM-to-Game integrations. He operates autonomously, manages a multi-step action loop, reasons about 3D space, and can even learn new procedures over time.
+CAINE pushes the boundaries of LLM-to-game integration. He operates autonomously, manages a multi-step action loop, reasons about 3D space, and learns new procedures over time.
 
 ---
 
 ## ✨ Key Features & Capabilities
 
 ### 🗣️ Conversational AI & Reasoning
-* **Hyper-Accurate Persona:** Speaks dynamically and dramatically like Caine from TADDC, reacting to context, game events, and player behavior in real-time.
+* **Hyper-Accurate Persona:** Speaks dynamically and dramatically like Caine from TADC, reacting to context, game events, and player behavior in real-time.
 * **Observe-Think-Act Loop:** CAINE doesn't just fire off one action and forget. He can execute an action, wait (e.g., up to 15 seconds), **observe** the environment or chat output, and make follow-up decisions based on what he sees (up to 5 recursive rounds).
 * **Multi-Part Comprehension:** Handles complex, compound requests gracefully (e.g., *"Give me 64 diamonds, turn it to night, look at me, and build a house right here"*).
 
@@ -58,7 +58,7 @@ Under the hood, CAINE maps his LLM output to over 30 distinct compiled `Action` 
 
 ## 🚀 How it Works (Under the Hood)
 
-1. **Pre-Warmed Gemini CLI:** To eliminate AI cold-start latency, the mod maintains a pool of pre-warmed Google Gemini CLI processes. By injecting prompts directly into `stdin` of a waiting process, CAINE responds instantly.
+1. **Pre-Warmed Gemini CLI:** To eliminate AI cold-start latency, the mod maintains a pool of pre-warmed Gemini CLI processes. By injecting prompts directly into `stdin` of a waiting, already-initialized process, CAINE responds near-instantly with no cold-start delay.
 2. **The Context Injector:** When triggered, CAINE builds a monolithic prompt containing:
    * Current game state (Time, Weather, Position)
    * A spatial terrain scan
@@ -75,7 +75,7 @@ Under the hood, CAINE maps his LLM output to over 30 distinct compiled `Action` 
 * **Minecraft Version:** `1.21.1`
 * **Platform:** Fabric Loader `0.16.5+` with Fabric API
 * **Java:** `21`
-* **Gemini CLI:** Must be installed on the host machine.
+* **[Gemini CLI](https://github.com/google-gemini/gemini-cli):** Must be installed and authenticated on the host machine.
 * **SQLite:** Bundled automatically for the memory system.
 
 ### Recommended Integrations:
