@@ -7,11 +7,11 @@ import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.block.BlockState;
 import net.minecraft.entity.Entity;
-import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.passive.AnimalEntity;
 import net.minecraft.entity.projectile.ProjectileUtil;
+import net.minecraft.item.ItemStack;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -27,6 +27,17 @@ import java.util.Map;
 import java.util.Optional;
 
 public class GameStateProvider {
+
+    // Last position before teleporting — set by ActionExecutor
+    private volatile String lastTeleportPosition = null;
+
+    public void setLastTeleportPosition(double x, double y, double z, String dimension) {
+        this.lastTeleportPosition = String.format("(%.0f, %.0f, %.0f) in %s", x, y, z, dimension);
+    }
+
+    public String getLastTeleportPosition() {
+        return lastTeleportPosition;
+    }
 
     public record PlayerInfo(String name, double x, double y, double z, float health) {
         public String formatted() {
@@ -133,6 +144,70 @@ public class GameStateProvider {
                 .orElse("unknown");
     }
 
+    public String getSelectedSlot() {
+        return getPlayer()
+                .map(p -> String.valueOf(p.getInventory().selectedSlot))
+                .orElse("0");
+    }
+
+    /**
+     * Returns a compact summary of the player's inventory (hotbar + notable items).
+     */
+    public String getInventoryString() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return "";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== YOUR INVENTORY ===\n");
+
+        // Hotbar (slots 0-8) with selected indicator
+        int selected = client.player.getInventory().selectedSlot;
+        sb.append("Hotbar:\n");
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = client.player.getInventory().getStack(i);
+            String marker = (i == selected) ? " [SELECTED]" : "";
+            if (stack.isEmpty()) {
+                sb.append("  Slot ").append(i).append(": (empty)").append(marker).append("\n");
+            } else {
+                sb.append("  Slot ").append(i).append(": ").append(stack.getCount()).append("x ")
+                        .append(stack.getName().getString()).append(marker).append("\n");
+            }
+        }
+
+        // Main inventory (slots 9-35) - compact summary
+        List<String> mainItems = new ArrayList<>();
+        for (int i = 9; i < 36; i++) {
+            ItemStack stack = client.player.getInventory().getStack(i);
+            if (!stack.isEmpty()) {
+                mainItems.add(stack.getCount() + "x " + stack.getName().getString());
+            }
+        }
+        if (!mainItems.isEmpty()) {
+            sb.append("Main inventory: ").append(String.join(", ", mainItems)).append("\n");
+        } else {
+            sb.append("Main inventory: (empty)\n");
+        }
+
+        // Offhand
+        ItemStack offhand = client.player.getOffHandStack();
+        if (!offhand.isEmpty()) {
+            sb.append("Offhand: ").append(offhand.getCount()).append("x ").append(offhand.getName().getString()).append("\n");
+        }
+
+        // Armor
+        List<String> armor = new ArrayList<>();
+        for (ItemStack armorStack : client.player.getInventory().armor) {
+            if (!armorStack.isEmpty()) {
+                armor.add(armorStack.getName().getString());
+            }
+        }
+        if (!armor.isEmpty()) {
+            sb.append("Armor: ").append(String.join(", ", armor)).append("\n");
+        }
+
+        return sb.toString();
+    }
+
     public String getBiome() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.world == null || client.player == null) return "unknown";
@@ -154,6 +229,7 @@ public class GameStateProvider {
         sb.append("Health: ").append(getHealth()).append("\n");
         sb.append("Hunger: ").append(getHunger()).append("\n");
         sb.append("Held item: ").append(getHeldItem()).append("\n");
+        sb.append("Selected slot: ").append(getSelectedSlot()).append("\n");
         sb.append("Dimension: ").append(getDimension()).append("\n");
         sb.append("Time: ").append(getTimeOfDay()).append("\n");
         sb.append("Biome: ").append(getBiome()).append("\n");
@@ -173,6 +249,17 @@ public class GameStateProvider {
             sb.append("All online players: ").append(String.join(", ", allOnline)).append("\n");
         } else {
             sb.append("No other players online\n");
+        }
+
+        // Inventory
+        String inventory = getInventoryString();
+        if (!inventory.isEmpty()) {
+            sb.append("\n").append(inventory);
+        }
+
+        // Last position before teleporting
+        if (lastTeleportPosition != null) {
+            sb.append("Previous position (before last TP): ").append(lastTeleportPosition).append("\n");
         }
 
         // Surroundings — what CAINE can see

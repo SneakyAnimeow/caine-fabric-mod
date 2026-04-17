@@ -61,7 +61,7 @@ public class CaineModClient implements ClientModInitializer {
         GameStateProvider gameState = new GameStateProvider();
         BaritoneWrapper baritone = new BaritoneWrapper();
         GeminiRunner gemini = new GeminiRunner(systemPromptPath);
-        ActionExecutor executor = new ActionExecutor(gameState, baritone, memoryManager);
+        ActionExecutor executor = new ActionExecutor(gameState, baritone, memoryManager, chatManager);
         CaineScheduler scheduler = new CaineScheduler(chatManager, gameState, gemini, executor, memoryManager);
 
         // Register chat receive events

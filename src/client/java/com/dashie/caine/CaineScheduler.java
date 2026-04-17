@@ -39,6 +39,7 @@ public class CaineScheduler {
     // Debounce state: accumulate a brief window after first mention, then fire
     private boolean debouncing = false;
     private String debounceSender = null;
+    private boolean debounceIsPro = false;
 
     public CaineScheduler(ChatManager chatManager, GameStateProvider gameState,
                           GeminiRunner gemini, ActionExecutor executor, MemoryManager memoryManager) {
@@ -49,11 +50,11 @@ public class CaineScheduler {
         this.memoryManager = memoryManager;
         this.nextPeriodicTrigger = randomInterval();
 
-        // Wire the observe-think-act followup handler
+        // Wire the observe-think-act followup handler (pro model persists through followups)
         executor.setFollowupHandler((waitSeconds, roundNumber) -> {
             CaineModClient.LOGGER.info("Followup round {} — building prompt after {}s observe", roundNumber, waitSeconds);
             String prompt = PromptBuilder.buildFollowup(chatManager, gameState, memoryManager, roundNumber);
-            String response = gemini.sendPromptSync(prompt);
+            String response = gemini.sendPromptSync(prompt, false);
             List<Action> actions = ActionParser.parse(response);
             CaineModClient.LOGGER.info("Followup round {} parsed {} actions", roundNumber, actions.size());
             return actions;
@@ -72,9 +73,19 @@ public class CaineScheduler {
         // If not currently debouncing or processing, pick up the next queued trigger
         if (!debouncing && !gemini.isProcessing() && cooldownTicks <= 0 && chatManager.hasPendingTrigger()) {
             debounceSender = chatManager.consumeTrigger();
+            debounceIsPro = chatManager.consumeProFlag();
             debouncing = true;
             debounceTicks = DEBOUNCE_TICKS;
-            CaineModClient.LOGGER.debug("Debounce started for mention by: {}", debounceSender);
+            CaineModClient.LOGGER.debug("Debounce started for mention by: {} (pro: {})", debounceSender, debounceIsPro);
+
+            // Send admin pass check command (response arrives during debounce window)
+            if (debounceSender != null) {
+                chatManager.startAdminCheck();
+                if (client.player != null && client.player.networkHandler != null) {
+                    client.player.networkHandler.sendCommand(
+                            "data get entity " + debounceSender + " Inventory");
+                }
+            }
         }
 
         // Debounce countdown — while debouncing, absorb any additional triggers from the same window
@@ -89,8 +100,9 @@ public class CaineScheduler {
             debounceTicks--;
             if (debounceTicks <= 0) {
                 debouncing = false;
-                triggerAI("mention", debounceSender);
+                triggerAI("mention", debounceSender, debounceIsPro);
                 debounceSender = null;
+                debounceIsPro = false;
             }
         }
 
@@ -105,12 +117,12 @@ public class CaineScheduler {
                     && cooldownTicks <= 0
                     && chatManager.hasRecentActivity()) {
                 CaineModClient.LOGGER.info("Periodic check-in triggered");
-                triggerAI("periodic", null);
+                triggerAI("periodic", null, false);
             }
         }
     }
 
-    private void triggerAI(String reason, String sender) {
+    private void triggerAI(String reason, String sender, boolean usePro) {
         if (gemini.isProcessing()) {
             // Re-queue the trigger so it's not lost
             if (sender != null) {
@@ -119,11 +131,17 @@ public class CaineScheduler {
             return;
         }
 
-        CaineModClient.LOGGER.info("Triggering AI (reason: {}, sender: {})", reason, sender);
+        CaineModClient.LOGGER.info("Triggering AI (reason: {}, sender: {}, pro: {})", reason, sender, usePro);
 
-        String prompt = PromptBuilder.build(chatManager, gameState, memoryManager, reason, sender);
+        // Consume admin pass check result (was sent during debounce)
+        boolean hasAdminPass = chatManager.consumeAdminCheck();
+        if (hasAdminPass) {
+            CaineModClient.LOGGER.info("Admin pass detected for player: {}", sender);
+        }
 
-        gemini.sendPrompt(prompt,
+        String prompt = PromptBuilder.build(chatManager, gameState, memoryManager, reason, sender, hasAdminPass);
+
+        gemini.sendPrompt(prompt, usePro,
                 response -> {
                     List<Action> actions = ActionParser.parse(response);
                     CaineModClient.LOGGER.info("Parsed {} actions from AI response", actions.size());

@@ -102,6 +102,8 @@ public class ActionParser {
         // Fallback: treat entire text as a chat message
         String fallback = aiResponse.replaceAll("```[\\s\\S]*?```", "").trim();
         fallback = fallback.replaceAll("[{}\"\\[\\]]", "").trim();
+        // Strip any non-printable / control characters that Minecraft rejects
+        fallback = fallback.replaceAll("[^\\x20-\\x7E\\xA0-\\xFF]", "").trim();
         if (fallback.isEmpty()) {
             fallback = "The show... must go on! *adjusts hat nervously*";
         }
@@ -177,11 +179,40 @@ public class ActionParser {
                             str(obj, "subject", ""),
                             str(obj, "content", ""),
                             num(obj, "importance", 5));
+                    case "forget_memory" -> new Action.ForgetMemory(
+                            str(obj, "subject", ""),
+                            str(obj, "category", ""));
+                    case "recall_memory" -> new Action.RecallMemory(
+                            str(obj, "query", ""));
                     case "stop_task" -> new Action.StopTask();
                     case "observe" -> new Action.Observe(Math.min(num(obj, "seconds", 3), 15));
                     case "delay" -> new Action.Delay(Math.max(1, Math.min(num(obj, "seconds", 1), 60)));
                     case "wait" -> new Action.Wait(Math.max(1, Math.min(num(obj, "seconds", 1), 60)));
                     case "nothing" -> new Action.Nothing();
+                    case "use_item_on_block" -> new Action.UseItemOnBlock(
+                            num(obj, "x", 0), num(obj, "y", 64), num(obj, "z", 0));
+                    case "use_item_on_entity" -> new Action.UseItemOnEntity(
+                            str(obj, "target", ""));
+                    case "select_slot" -> new Action.SelectSlot(
+                            Math.max(0, Math.min(num(obj, "slot", 0), 8)));
+                    case "attack" -> new Action.Attack(
+                            str(obj, "target", ""));
+                    case "backup_inventory" -> new Action.BackupInventory(
+                            str(obj, "player", ""));
+                    case "restore_inventory" -> new Action.RestoreInventory(
+                            str(obj, "player", ""));
+                    case "run_script" -> {
+                        List<String> cmds = new ArrayList<>();
+                        if (obj.has("commands") && obj.get("commands").isJsonArray()) {
+                            for (JsonElement cmd : obj.getAsJsonArray("commands")) {
+                                if (!cmd.isJsonNull()) cmds.add(cmd.getAsString());
+                            }
+                        }
+                        yield new Action.RunScript(cmds,
+                                Math.max(1, Math.min(num(obj, "delay_ticks", 1), 20)),
+                                Math.max(1, Math.min(num(obj, "repeat", 1), 1000)),
+                                str(obj, "stop_condition", ""));
+                    }
                     default -> {
                         CaineModClient.LOGGER.warn("Unknown action type: {}", type);
                         yield null;

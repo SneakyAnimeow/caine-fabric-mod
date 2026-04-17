@@ -20,6 +20,7 @@ public class ChatManager {
     private static final Pattern CAINE_PATTERN = Pattern.compile(
             "\\bc+a+i+n+e+\\b", Pattern.CASE_INSENSITIVE);
     private static final String SWITCH_CMD = "$switch_auto_state";
+    private static final String PRO_PREFIX = "$pro ";
 
     private final Deque<ChatEntry> history = new ArrayDeque<>();
     // Queue of senders who called CAINE (processed in order)
@@ -29,6 +30,14 @@ public class ChatManager {
     private volatile long lastMessageTime = 0;
     // Toggled by $switch_auto_state
     private volatile boolean autoMessagesEnabled = true;
+    // Set when a trigger message starts with $pro
+    private volatile boolean proRequested = false;
+    // Admin pass check — intercept inventory data response
+    private volatile boolean captureAdminCheck = false;
+    private volatile String adminCheckResult = null;
+    // Condition check — intercept /execute if result for run_script stop_condition
+    private volatile boolean captureCondition = false;
+    private volatile String conditionResult = null;
     // Counter used as unique message IDs
     private long messageIdCounter = 0;
 
@@ -61,10 +70,30 @@ public class ChatManager {
             return;
         }
 
+        // Extract the raw message body (without the "<Sender> " chat prefix)
+        String rawBody = signedMessage != null
+                ? signedMessage.getSignedContent()
+                : stripChatPrefix(text, senderName);
+
+        // Check for $pro prefix — strip it from the stored message and set flag
+        String processedText = text;
+        boolean isPro = false;
+        if (rawBody.trim().toLowerCase().startsWith(PRO_PREFIX)) {
+            isPro = true;
+            processedText = rawBody.trim().substring(PRO_PREFIX.length());
+            // Update the entry in history to strip the $pro prefix
+            // (remove last entry and re-add without $pro)
+            if (!history.isEmpty() && history.peekLast().id() == messageIdCounter) {
+                history.removeLast();
+                addEntry(new ChatEntry(messageIdCounter, System.currentTimeMillis(), senderName, processedText, false, isOwn));
+            }
+        }
+
         // Check if someone mentioned CAINE (normal or screaming)
-        if (CAINE_PATTERN.matcher(text).find()) {
+        if (CAINE_PATTERN.matcher(processedText).find()) {
+            if (isPro) proRequested = true;
             triggerQueue.add(senderName);
-            CaineModClient.LOGGER.info("CAINE called by: {} (queue size: {})", senderName, triggerQueue.size());
+            CaineModClient.LOGGER.info("CAINE called by: {} (queue size: {}, pro: {})", senderName, triggerQueue.size(), isPro);
         }
     }
 
@@ -72,6 +101,21 @@ public class ChatManager {
         if (overlay) return;
         String text = message.getString();
         if (text.isBlank()) return;
+
+        // Silently intercept admin check response — don't add to history
+        if (captureAdminCheck && text.contains("has the following entity data")) {
+            adminCheckResult = text;
+            captureAdminCheck = false;
+            return;
+        }
+
+        // Silently intercept condition check response (Test passed/Test failed)
+        if (captureCondition && (text.contains("Test passed") || text.contains("Test failed"))) {
+            conditionResult = text;
+            captureCondition = false;
+            return;
+        }
+
         addEntry(new ChatEntry(++messageIdCounter, System.currentTimeMillis(), "SYSTEM", text, true, false));
     }
 
@@ -91,6 +135,15 @@ public class ChatManager {
             }
         }
         return "Unknown";
+    }
+
+    /** Strips the leading "<SenderName> " prefix from a rendered chat line. */
+    private String stripChatPrefix(String text, String senderName) {
+        String prefix = "<" + senderName + "> ";
+        if (text.startsWith(prefix)) return text.substring(prefix.length());
+        // Also handle cases without the angle-bracket wrapper
+        if (text.startsWith(senderName + ": ")) return text.substring(senderName.length() + 2);
+        return text;
     }
 
     // --- Trigger queue ---
@@ -134,12 +187,76 @@ public class ChatManager {
         return (int) history.stream().filter(e -> e.id() > lastRespondedMessageId).count();
     }
 
+    /**
+     * Returns the raw text of recent NEW messages (for keyword extraction).
+     */
+    public synchronized String getRecentNewMessageText() {
+        return history.stream()
+                .filter(e -> e.id() > lastRespondedMessageId && !e.isOwnMessage() && !e.isSystem())
+                .map(ChatEntry::message)
+                .collect(Collectors.joining(" "));
+    }
+
     public synchronized boolean hasRecentActivity() {
         return System.currentTimeMillis() - lastMessageTime < 300_000;
     }
 
     public boolean isAutoMessagesEnabled() {
         return autoMessagesEnabled;
+    }
+
+    /**
+     * Returns and resets the pro model flag.
+     * Called when consuming a trigger to check if $pro was requested.
+     */
+    public boolean consumeProFlag() {
+        boolean was = proRequested;
+        proRequested = false;
+        return was;
+    }
+
+    /**
+     * Start listening for the admin check inventory response.
+     */
+    public void startAdminCheck() {
+        adminCheckResult = null;
+        captureAdminCheck = true;
+    }
+
+    /**
+     * Consume the admin check result. Returns true if the player has a
+     * written book named "Admin Pass" signed by "VarenXD".
+     * Resets the capture state regardless.
+     */
+    public boolean consumeAdminCheck() {
+        captureAdminCheck = false;
+        String result = adminCheckResult;
+        adminCheckResult = null;
+        if (result == null) return false;
+        return result.contains("written_book")
+                && result.contains("Admin Pass")
+                && result.contains("VarenXD");
+    }
+
+    /**
+     * Start listening for a condition check response (Test passed / Test failed).
+     */
+    public void startConditionCapture() {
+        conditionResult = null;
+        captureCondition = true;
+    }
+
+    /**
+     * Consume the condition check result.
+     * Returns true if "Test passed" (condition met), false if "Test failed".
+     * Returns true (continue) if no response was captured (e.g. sendCommandFeedback off).
+     */
+    public boolean consumeConditionResult() {
+        captureCondition = false;
+        String result = conditionResult;
+        conditionResult = null;
+        if (result == null) return true; // No feedback — assume pass
+        return result.contains("Test passed");
     }
 
     public synchronized int getMessageCount() {

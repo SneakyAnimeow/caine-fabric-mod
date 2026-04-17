@@ -1,13 +1,21 @@
 package com.dashie.caine.action;
 
 import com.dashie.caine.CaineModClient;
+import com.dashie.caine.chat.ChatManager;
 import com.dashie.caine.game.BaritoneWrapper;
 import com.dashie.caine.game.GameStateProvider;
 import com.dashie.caine.memory.MemoryManager;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.entity.Entity;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -18,13 +26,16 @@ import java.util.concurrent.ScheduledExecutorService;
 
 public class ActionExecutor {
     private static final int MAX_CHAT_LENGTH = 200;
-    private static final int MAX_FOLLOWUP_ROUNDS = 3;
+    private static final int MAX_FOLLOWUP_ROUNDS = 5;
 
     private final GameStateProvider gameState;
     private final BaritoneWrapper baritone;
     private final MemoryManager memoryManager;
+    private final ChatManager chatManager;
     // Tracks the last player targeted by tp/look actions so we can auto-look before chatting
     private volatile String lastTargetPlayer = null;
+    // Skip auto-backup during restore to avoid overwriting the backup we're restoring from
+    private volatile boolean skipAutoBackup = false;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "CAINE-Actions");
         t.setDaemon(true);
@@ -42,10 +53,11 @@ public class ActionExecutor {
 
     private FollowupHandler followupHandler;
 
-    public ActionExecutor(GameStateProvider gameState, BaritoneWrapper baritone, MemoryManager memoryManager) {
+    public ActionExecutor(GameStateProvider gameState, BaritoneWrapper baritone, MemoryManager memoryManager, ChatManager chatManager) {
         this.gameState = gameState;
         this.baritone = baritone;
         this.memoryManager = memoryManager;
+        this.chatManager = chatManager;
     }
 
     public void setFollowupHandler(FollowupHandler handler) {
@@ -126,6 +138,8 @@ public class ActionExecutor {
             case Action.Mine mine -> executeMine(mine.block(), mine.quantity());
             case Action.GiveItem give -> executeGiveItem(give.player(), give.item(), give.count(), give.drop());
             case Action.SaveMemory mem -> executeSaveMemory(mem.category(), mem.subject(), mem.content(), mem.importance());
+            case Action.ForgetMemory fm -> executeForgetMemory(fm.subject(), fm.category());
+            case Action.RecallMemory rm -> executeRecallMemory(rm.query());
             case Action.StopTask ignored -> executeStopTask();
             case Action.Observe ignored -> {} // Handled in executeActionList before reaching here
             case Action.Delay delay -> {
@@ -137,12 +151,22 @@ public class ActionExecutor {
                 Thread.sleep(wait.seconds() * 1000L);
             }
             case Action.Nothing ignored -> CaineModClient.LOGGER.info("Doing nothing (intentional)");
+            case Action.UseItemOnBlock uib -> executeUseItemOnBlock(uib.x(), uib.y(), uib.z());
+            case Action.UseItemOnEntity uie -> executeUseItemOnEntity(uie.target());
+            case Action.SelectSlot ss -> executeSelectSlot(ss.slot());
+            case Action.Attack atk -> executeAttack(atk.target());
+            case Action.BackupInventory bi -> executeBackupInventory(bi.player());
+            case Action.RestoreInventory ri -> executeRestoreInventory(ri.player());
+            case Action.RunScript rs -> executeRunScript(rs.commands(), rs.delayTicks(), rs.repeat(), rs.stopCondition());
         }
     }
 
     private void executeChat(String message) throws InterruptedException {
         MinecraftClient client = MinecraftClient.getInstance();
-        List<String> parts = splitMessage(message);
+        // Strip characters that Minecraft considers illegal in chat
+        String sanitized = message.replaceAll("[^\\x20-\\x7E\\xA0-\\xFF]", "").trim();
+        if (sanitized.isEmpty()) return;
+        List<String> parts = splitMessage(sanitized);
 
         for (String part : parts) {
             client.execute(() -> {
@@ -162,9 +186,20 @@ public class ActionExecutor {
         String cmd = command.startsWith("/") ? command.substring(1) : command;
         MinecraftClient client = MinecraftClient.getInstance();
         client.execute(() -> {
-            if (client.player != null && client.player.networkHandler != null) {
-                client.player.networkHandler.sendCommand(cmd);
+            if (client.player == null || client.player.networkHandler == null) return;
+
+            // Auto-backup inventory before any /clear <player> command
+            if (!skipAutoBackup && cmd.startsWith("clear ")) {
+                String target = cmd.substring(6).split(" ")[0].trim();
+                if (!target.isEmpty() && !target.startsWith("@")) {
+                    CaineModClient.LOGGER.info("Auto-backing up {}'s inventory before clear", target);
+                    client.player.networkHandler.sendCommand(
+                            "data modify storage caine:backups " + target +
+                                    " set from entity " + target + " Inventory");
+                }
             }
+
+            client.player.networkHandler.sendCommand(cmd);
         });
     }
 
@@ -175,6 +210,9 @@ public class ActionExecutor {
     private void executeTpToPlayer(String playerName) throws InterruptedException {
         if (playerName.isEmpty()) return;
         MinecraftClient client = MinecraftClient.getInstance();
+
+        // Save current position before teleporting
+        savePositionBeforeTP(client);
 
         // Check distance and visibility on game thread, then decide
         client.execute(() -> {
@@ -254,8 +292,9 @@ public class ActionExecutor {
     }
 
     private void executePathfind(int x, int y, int z) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        savePositionBeforeTP(client);
         if (baritone.isAvailable()) {
-            MinecraftClient client = MinecraftClient.getInstance();
             client.execute(() -> baritone.pathfindTo(x, y, z));
         } else {
             // Fallback: instant teleport via command
@@ -345,6 +384,228 @@ public class ActionExecutor {
     private void executeSaveMemory(String category, String subject, String content, int importance) {
         if (content.isEmpty()) return;
         memoryManager.saveMemory(category, subject, content, importance);
+    }
+
+    private void executeForgetMemory(String subject, String category) {
+        if (subject.isEmpty()) return;
+        int forgotten = memoryManager.forgetBySubject(subject, category);
+        CaineModClient.LOGGER.info("Forgot {} memories about '{}' (category: {})", forgotten, subject,
+                category.isEmpty() ? "all" : category);
+    }
+
+    private void executeRecallMemory(String query) {
+        if (query.isEmpty()) return;
+        var results = memoryManager.searchMemories(query, 10);
+        if (results.isEmpty()) {
+            CaineModClient.LOGGER.info("Recall '{}': no memories found", query);
+        } else {
+            CaineModClient.LOGGER.info("Recall '{}': found {} memories", query, results.size());
+            for (var m : results) {
+                CaineModClient.LOGGER.info("  Memory: [{}] {} — {}", m.category(), m.subject(), m.content());
+            }
+        }
+    }
+
+    private void savePositionBeforeTP(MinecraftClient client) {
+        if (client.player != null && client.world != null) {
+            String dim = client.world.getRegistryKey().getValue().toString();
+            gameState.setLastTeleportPosition(
+                    client.player.getX(), client.player.getY(), client.player.getZ(), dim);
+            CaineModClient.LOGGER.info("Saved pre-TP position: ({}, {}, {}) in {}",
+                    (int) client.player.getX(), (int) client.player.getY(),
+                    (int) client.player.getZ(), dim);
+        }
+    }
+
+    private void executeUseItemOnBlock(int x, int y, int z) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            if (client.player == null || client.interactionManager == null) return;
+            BlockPos blockPos = new BlockPos(x, y, z);
+            BlockHitResult hitResult = new BlockHitResult(
+                    Vec3d.ofCenter(blockPos), Direction.UP, blockPos, false);
+            client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, hitResult);
+            CaineModClient.LOGGER.info("Used item on block at ({}, {}, {})", x, y, z);
+        });
+    }
+
+    private void executeUseItemOnEntity(String targetName) {
+        if (targetName.isEmpty()) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            if (client.player == null || client.world == null || client.interactionManager == null) return;
+            Entity target = findNearestEntityByName(client, targetName);
+            if (target != null) {
+                client.interactionManager.interactEntity(client.player, target, Hand.MAIN_HAND);
+                CaineModClient.LOGGER.info("Used item on entity: {}", targetName);
+            } else {
+                CaineModClient.LOGGER.warn("Entity not found for interaction: {}", targetName);
+            }
+        });
+    }
+
+    private void executeSelectSlot(int slot) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            if (client.player != null) {
+                client.player.getInventory().selectedSlot = Math.max(0, Math.min(slot, 8));
+                CaineModClient.LOGGER.info("Selected hotbar slot {}", slot);
+            }
+        });
+    }
+
+    private void executeAttack(String targetName) {
+        if (targetName.isEmpty()) return;
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            if (client.player == null || client.world == null || client.interactionManager == null) return;
+            Entity target = findNearestEntityByName(client, targetName);
+            if (target != null) {
+                client.interactionManager.attackEntity(client.player, target);
+                client.player.swingHand(Hand.MAIN_HAND);
+                CaineModClient.LOGGER.info("Attacked entity: {}", targetName);
+            } else {
+                CaineModClient.LOGGER.warn("Entity not found for attack: {}", targetName);
+            }
+        });
+    }
+
+    /**
+     * Finds the nearest entity matching the given name (player name or entity type).
+     */
+    private Entity findNearestEntityByName(MinecraftClient client, String name) {
+        if (client.player == null || client.world == null) return null;
+
+        // First try as a player name
+        Optional<AbstractClientPlayerEntity> player = gameState.findPlayer(name);
+        if (player.isPresent()) return player.get();
+
+        // Search nearby entities by display name
+        Box area = client.player.getBoundingBox().expand(10.0);
+        Entity closest = null;
+        double closestDist = Double.MAX_VALUE;
+        for (Entity entity : client.world.getOtherEntities(client.player, area)) {
+            if (entity.getName().getString().equalsIgnoreCase(name)
+                    || entity.getType().getName().getString().equalsIgnoreCase(name)) {
+                double dist = client.player.distanceTo(entity);
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    closest = entity;
+                }
+            }
+        }
+        return closest;
+    }
+
+    private void executeBackupInventory(String player) {
+        if (player.isEmpty()) return;
+        CaineModClient.LOGGER.info("Backing up {}'s inventory to server storage", player);
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            if (client.player != null && client.player.networkHandler != null) {
+                client.player.networkHandler.sendCommand(
+                        "data modify storage caine:backups " + player +
+                                " set from entity " + player + " Inventory");
+            }
+        });
+    }
+
+    /**
+     * Executes a batch of commands in rapid succession.
+     * Each command is fired on the game thread with a configurable tick delay between them.
+     * This enables complex multi-step operations without needing server-side datapacks.
+     */
+    private void executeRunScript(List<String> commands, int delayTicks, int repeat, String stopCondition) throws InterruptedException {
+        if (commands.isEmpty()) return;
+        long delayMs = delayTicks * 50L; // 1 tick = 50ms
+        boolean hasCondition = stopCondition != null && !stopCondition.isBlank();
+        int totalCommands = commands.size() * repeat;
+        CaineModClient.LOGGER.info("Running script: {} commands x {} repeats = {} total, {}ms between each{}",
+                commands.size(), repeat, totalCommands, delayMs,
+                hasCondition ? ", stop_condition: " + stopCondition : "");
+
+        for (int r = 0; r < repeat; r++) {
+            // Check stop condition before each repeat (after the first)
+            if (r > 0 && hasCondition) {
+                if (!checkStopCondition(stopCondition)) {
+                    CaineModClient.LOGGER.info("Stop condition failed at repeat {}/{}, stopping early", r + 1, repeat);
+                    break;
+                }
+            }
+            for (int i = 0; i < commands.size(); i++) {
+                String cmd = commands.get(i);
+                if (cmd == null || cmd.isBlank()) continue;
+                executeCommand(cmd);
+                if (r < repeat - 1 || i < commands.size() - 1) {
+                    Thread.sleep(delayMs);
+                }
+            }
+        }
+        CaineModClient.LOGGER.info("Script execution complete ({} commands x {} repeats)", commands.size(), repeat);
+    }
+
+    /**
+     * Runs an /execute if ... condition command and checks server feedback.
+     * Returns true if "Test passed" (condition met, keep going), false if "Test failed" (stop).
+     */
+    private boolean checkStopCondition(String condition) throws InterruptedException {
+        chatManager.startConditionCapture();
+        executeCommand(condition);
+        // Wait for the server to send back "Test passed" or "Test failed"
+        Thread.sleep(200);
+        return chatManager.consumeConditionResult();
+    }
+
+    /**
+     * Restores a player's inventory from server-side storage backup.
+     * Uses item entities spawned from storage data — items may end up in different slots.
+     */
+    private void executeRestoreInventory(String player) throws InterruptedException {
+        if (player.isEmpty()) return;
+        CaineModClient.LOGGER.info("Restoring {}'s inventory from backup", player);
+
+        // Clean up any leftover restore entities
+        executeCommand("kill @e[tag=caine_r]");
+        Thread.sleep(300);
+
+        // Clear current inventory — skip auto-backup since we're restoring
+        skipAutoBackup = true;
+        executeCommand("clear " + player);
+        Thread.sleep(300);
+        skipAutoBackup = false;
+
+        // Iterate through all possible inventory indices (player can have up to 41 items)
+        // For each stored item: summon a temp item entity, copy data from storage, TP to player for pickup
+        for (int i = 0; i < 41; i++) {
+            // Only summon if this index exists in the backup
+            executeCommand(String.format(
+                    "execute if data storage caine:backups %s[%d] run summon item ~ 320 ~ " +
+                            "{Tags:[\"caine_r\"],Item:{id:\"minecraft:stone\",count:1}," +
+                            "PickupDelay:32767,Age:-32768,NoGravity:1b}",
+                    player, i));
+            Thread.sleep(50);
+
+            // Copy actual item data from backup storage to the entity
+            executeCommand(String.format(
+                    "data modify entity @e[tag=caine_r,limit=1] Item set from storage caine:backups %s[%d]",
+                    player, i));
+
+            // Remove the Slot tag (not valid for item entities)
+            executeCommand("data remove entity @e[tag=caine_r,limit=1] Item.Slot");
+
+            // Enable pickup and teleport to player
+            executeCommand("data modify entity @e[tag=caine_r,limit=1] PickupDelay set value 0");
+            executeCommand(String.format("tp @e[tag=caine_r,limit=1] %s", player));
+            Thread.sleep(100);
+
+            // Remove tag for next iteration
+            executeCommand("tag @e[tag=caine_r] remove caine_r");
+        }
+
+        // Final cleanup
+        Thread.sleep(500);
+        executeCommand("kill @e[tag=caine_r]");
+        CaineModClient.LOGGER.info("Inventory restore complete for {}", player);
     }
 
     /**

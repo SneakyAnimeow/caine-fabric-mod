@@ -6,6 +6,8 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -15,6 +17,9 @@ import java.util.stream.Collectors;
 
 public class GeminiRunner {
     private static final long TIMEOUT_SECONDS = 120;
+    private static final String PRO_MODEL = "pro";
+    private static final int MAX_RETRIES = 3;
+    private static final long[] RETRY_DELAYS_MS = {5_000, 15_000, 30_000};
 
     private final Path systemPromptPath;
     private final String geminiBinary;
@@ -41,11 +46,11 @@ public class GeminiRunner {
      * Used for followup rounds during observe-think-act loops.
      * Does NOT check/set the processing flag (caller manages that).
      */
-    public String sendPromptSync(String prompt) throws Exception {
-        return callGemini(prompt);
+    public String sendPromptSync(String prompt, boolean usePro) throws Exception {
+        return callGemini(prompt, usePro ? PRO_MODEL : null);
     }
 
-    public void sendPrompt(String prompt, Consumer<String> onSuccess, Consumer<Exception> onError) {
+    public void sendPrompt(String prompt, boolean usePro, Consumer<String> onSuccess, Consumer<Exception> onError) {
         if (processing) {
             onError.accept(new IllegalStateException("Already processing a request"));
             return;
@@ -54,7 +59,10 @@ public class GeminiRunner {
         processing = true;
         CompletableFuture.runAsync(() -> {
             try {
-                String response = callGemini(prompt);
+                String response = callGemini(prompt, usePro ? PRO_MODEL : null);
+                if (usePro) {
+                    CaineModClient.LOGGER.info("Used PRO model for this request");
+                }
                 onSuccess.accept(response);
             } catch (Exception e) {
                 CaineModClient.LOGGER.error("Gemini CLI error", e);
@@ -99,10 +107,36 @@ public class GeminiRunner {
         return "none";
     }
 
-    private String callGemini(String prompt) throws Exception {
-        // Build process: gemini -p "<prompt>"
+    private String callGemini(String prompt, String model) throws Exception {
+        Exception lastError = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                return callGeminiOnce(prompt, model);
+            } catch (Exception e) {
+                lastError = e;
+                if (attempt < MAX_RETRIES - 1) {
+                    long delay = RETRY_DELAYS_MS[attempt];
+                    CaineModClient.LOGGER.warn("Gemini CLI attempt {}/{} failed: {}. Retrying in {}s...",
+                            attempt + 1, MAX_RETRIES, e.getMessage(), delay / 1000);
+                    Thread.sleep(delay);
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    private String callGeminiOnce(String prompt, String model) throws Exception {
+        // Build process: gemini [-m model] -p "<prompt>"
         // System prompt is set via GEMINI_SYSTEM_MD env var
-        ProcessBuilder pb = new ProcessBuilder(geminiBinary, "-p", prompt);
+        List<String> command = new ArrayList<>();
+        command.add(geminiBinary);
+        if (model != null && !model.isEmpty()) {
+            command.add("-m");
+            command.add(model);
+        }
+        command.add("-p");
+        command.add(prompt);
+        ProcessBuilder pb = new ProcessBuilder(command);
 
         // Set system prompt path
         pb.environment().put("GEMINI_SYSTEM_MD", systemPromptPath.toAbsolutePath().toString());
@@ -139,6 +173,8 @@ public class GeminiRunner {
         if (process.exitValue() != 0) {
             CaineModClient.LOGGER.warn("Gemini CLI non-zero exit: {}. Output: {}",
                     process.exitValue(), output.length() > 500 ? output.substring(0, 500) + "..." : output);
+            throw new RuntimeException("Gemini CLI failed (exit " + process.exitValue() + "): "
+                    + (output.length() > 200 ? output.substring(0, 200) : output));
         }
 
         if (output.isBlank()) {
