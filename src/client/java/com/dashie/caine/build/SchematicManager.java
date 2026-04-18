@@ -317,11 +317,13 @@ public class SchematicManager {
      * @return List of /setblock commands, empty if parsing failed
      */
     public List<String> schematicToCommands(Path file, int originX, int originY, int originZ) {
-        String filename = file.getFileName().toString().toLowerCase();
-        if (filename.endsWith(".litematic")) {
+        String format = detectSchematicFormat(file);
+        if ("litematic".equals(format)) {
             return parseLitematic(file, originX, originY, originZ);
+        } else if ("schem".equals(format)) {
+            return parseSchem(file, originX, originY, originZ);
         }
-        CaineModClient.LOGGER.warn("Direct command generation not supported for format: {}", filename);
+        CaineModClient.LOGGER.warn("Could not detect schematic format for: {}", file.getFileName());
         return List.of();
     }
 
@@ -332,6 +334,16 @@ public class SchematicManager {
     public SchematicSize getSchematicSize(Path file) {
         try {
             NbtCompound root = NbtIo.readCompressed(file, NbtSizeTracker.ofUnlimitedBytes());
+            // Detect by content: .schem has Width/Height/Length or Schematic wrapper
+            if (root.contains("Width") || root.contains("Schematic", NbtElement.COMPOUND_TYPE)) {
+                NbtCompound data = root.contains("Schematic", NbtElement.COMPOUND_TYPE)
+                        ? root.getCompound("Schematic") : root;
+                return new SchematicSize(
+                        data.getShort("Width"),
+                        data.getShort("Height"),
+                        data.getShort("Length"));
+            }
+            // .litematic has Metadata.EnclosingSize
             NbtCompound metadata = root.getCompound("Metadata");
             NbtCompound enclosing = metadata.getCompound("EnclosingSize");
             return new SchematicSize(
@@ -340,6 +352,31 @@ public class SchematicManager {
                     Math.abs(enclosing.getInt("z")));
         } catch (Exception e) {
             CaineModClient.LOGGER.warn("Failed to read schematic size: {}", file, e);
+            return null;
+        }
+    }
+
+    /**
+     * Detects the schematic format by reading the NBT content, regardless of file extension.
+     * Returns "litematic", "schem", or null if unrecognized.
+     */
+    private String detectSchematicFormat(Path file) {
+        try {
+            NbtCompound root = NbtIo.readCompressed(file, NbtSizeTracker.ofUnlimitedBytes());
+            // Sponge Schematic v3: has "Schematic" compound wrapper
+            if (root.contains("Schematic", NbtElement.COMPOUND_TYPE)) return "schem";
+            // Sponge Schematic v2: has Width, Height, Length at top level
+            if (root.contains("Width") && root.contains("Height") && root.contains("Length")) return "schem";
+            // Litematica: has Regions compound
+            if (root.contains("Regions", NbtElement.COMPOUND_TYPE)) return "litematic";
+            // Fallback: try file extension
+            String name = file.getFileName().toString().toLowerCase();
+            if (name.endsWith(".litematic")) return "litematic";
+            if (name.endsWith(".schem") || name.endsWith(".schematic")) return "schem";
+            CaineModClient.LOGGER.warn("Could not detect schematic format from content or extension: {}", file.getFileName());
+            return null;
+        } catch (Exception e) {
+            CaineModClient.LOGGER.warn("Failed to read schematic for format detection: {}", file.getFileName(), e);
             return null;
         }
     }
@@ -371,6 +408,112 @@ public class SchematicManager {
 
         } catch (Exception e) {
             CaineModClient.LOGGER.error("Failed to parse .litematic file: {}", file, e);
+            return List.of();
+        }
+    }
+
+    /**
+     * Parses a .schem (Sponge Schematic v2/v3) file and returns /setblock commands.
+     * Supports both v2 (flat structure) and v3 (nested under "Schematic" compound).
+     * Block data is varint-encoded, blocks are indexed in Y*Length*Width + Z*Width + X order.
+     */
+    private List<String> parseSchem(Path file, int originX, int originY, int originZ) {
+        try {
+            NbtCompound root = NbtIo.readCompressed(file, NbtSizeTracker.ofUnlimitedBytes());
+
+            // v3 wraps everything under "Schematic", v2 is flat
+            NbtCompound data = root.contains("Schematic", NbtElement.COMPOUND_TYPE)
+                    ? root.getCompound("Schematic") : root;
+
+            int version = data.getInt("Version");
+            int width = data.getShort("Width");
+            int height = data.getShort("Height");
+            int length = data.getShort("Length");
+
+            CaineModClient.LOGGER.info("Parsing .schem v{} ({}x{}x{}) → setblock commands",
+                    version, width, height, length);
+
+            // Offset (optional) — shifts the schematic origin
+            int offX = 0, offY = 0, offZ = 0;
+            if (data.contains("Offset", NbtElement.INT_ARRAY_TYPE)) {
+                int[] offset = data.getIntArray("Offset");
+                if (offset.length >= 3) {
+                    offX = offset[0];
+                    offY = offset[1];
+                    offZ = offset[2];
+                }
+            }
+
+            // Read palette and block data — location differs between v2 and v3
+            NbtCompound paletteNbt;
+            byte[] blockData;
+
+            if (version >= 3 && data.contains("Blocks", NbtElement.COMPOUND_TYPE)) {
+                // v3: Blocks.Palette and Blocks.Data
+                NbtCompound blocks = data.getCompound("Blocks");
+                paletteNbt = blocks.getCompound("Palette");
+                blockData = blocks.getByteArray("Data");
+            } else {
+                // v2: Palette and BlockData at top level
+                paletteNbt = data.getCompound("Palette");
+                blockData = data.getByteArray("BlockData");
+            }
+
+            if (paletteNbt.isEmpty() || blockData.length == 0) {
+                CaineModClient.LOGGER.warn(".schem file has empty palette or block data");
+                return List.of();
+            }
+
+            // Build reverse palette: int ID → block state string
+            String[] palette = new String[paletteNbt.getSize()];
+            for (String blockState : paletteNbt.getKeys()) {
+                int id = paletteNbt.getInt(blockState);
+                if (id >= 0 && id < palette.length) {
+                    palette[id] = blockState;
+                }
+            }
+
+            // Decode varint block data and generate commands
+            List<String> commands = new ArrayList<>();
+            int index = 0;
+            int dataPos = 0;
+
+            while (dataPos < blockData.length && commands.size() < MAX_SCHEMATIC_BLOCKS) {
+                // Read varint
+                int paletteIndex = 0;
+                int varintLength = 0;
+                int currentByte;
+                do {
+                    if (dataPos >= blockData.length) break;
+                    currentByte = blockData[dataPos] & 0xFF;
+                    paletteIndex |= (currentByte & 0x7F) << (varintLength * 7);
+                    varintLength++;
+                    dataPos++;
+                } while ((currentByte & 0x80) != 0 && varintLength < 5);
+
+                if (paletteIndex >= 0 && paletteIndex < palette.length && palette[paletteIndex] != null) {
+                    String blockState = palette[paletteIndex];
+                    if (!isAirBlock(blockState)) {
+                        // Index order: Y * length * width + Z * width + X
+                        int x = index % width;
+                        int z = (index / width) % length;
+                        int y = index / (width * length);
+
+                        int worldX = originX + offX + x;
+                        int worldY = originY + offY + y;
+                        int worldZ = originZ + offZ + z;
+
+                        commands.add("setblock " + worldX + " " + worldY + " " + worldZ + " " + blockState);
+                    }
+                }
+                index++;
+            }
+
+            CaineModClient.LOGGER.info("Generated {} setblock commands from .schem", commands.size());
+            return commands;
+
+        } catch (Exception e) {
+            CaineModClient.LOGGER.error("Failed to parse .schem file: {}", file, e);
             return List.of();
         }
     }

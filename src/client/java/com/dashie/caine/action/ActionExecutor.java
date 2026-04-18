@@ -753,7 +753,7 @@ public class ActionExecutor {
 
         if (commands.isEmpty()) {
             CaineModClient.LOGGER.warn("No build commands generated from schematic '{}'", name);
-            chatManager.addInternalFeedback("Could not parse schematic '" + name + "' for building. Only .litematic format is supported for direct building.");
+            chatManager.addInternalFeedback("Could not parse schematic '" + name + "' for building. Supported formats: .litematic, .schem");
             return;
         }
 
